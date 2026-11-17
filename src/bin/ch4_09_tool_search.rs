@@ -3,18 +3,19 @@
 use std::{
     env,
     io::{self, Write},
-    path::PathBuf,
     process::Stdio,
 };
 
 use ai_agents_with_mcp::{
     calculator_server::serve_stdio,
     client_callbacks::CalculatorClientHandler,
-    config::{anthropic_client, anthropic_model, load_dotenv},
-    interactive_agent::{collect_prompt, select_resources},
+    config::{
+        anthropic_client, anthropic_model, load_dotenv, max_model_calls, mcp_root, mcp_root_uri,
+    },
+    interactive_agent::{collect_prompt, select_resources, user_message_with_resources},
     tool_results::content_as_strings,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use rig::completion::{
     message::{AssistantContent, Message, ToolName, ToolResultContent},
     request::{CompletionRequest, ToolDefinition},
@@ -22,7 +23,6 @@ use rig::completion::{
 use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
 use tokio::process::Command;
 
-const MAX_MODEL_CALLS: usize = 16;
 const SYSTEM_PROMPT: &str = "You have a search_tools tool that finds more tools. If no available tool fits a request, search for one before deciding that you cannot complete it. The search is a simple substring match, so search with one short keyword (like 'count' or 'add'), never a phrase, and try another keyword if the first finds nothing.";
 
 #[tokio::main]
@@ -34,14 +34,8 @@ async fn main() -> Result<()> {
     let provider = anthropic_client()?;
     let model_name = anthropic_model()?;
     let model = provider.completion(model_name.clone());
-    let root = env::var_os("MCP_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?);
-    let root = root
-        .canonicalize()
-        .context("MCP_ROOT must point to an existing directory")?;
-    ensure!(root.is_dir(), "MCP_ROOT must point to a directory");
-    let handler = CalculatorClientHandler::new(format!("file://{}", root.display()), model_name);
+    let root = mcp_root()?;
+    let handler = CalculatorClientHandler::new(mcp_root_uri(&root)?, model_name);
 
     let executable = env::current_exe()?;
     let mut command = Command::new(executable);
@@ -53,6 +47,7 @@ async fn main() -> Result<()> {
         .serve(TokioChildProcess::new(command)?)
         .await
         .context("could not start the local calculator MCP server")?;
+    let run_result: Result<()> = async {
     let mut resources = mcp.list_all_resources().await?;
     let mut prompts = mcp.list_all_prompts().await?;
     let search = ToolDefinition::new(
@@ -95,26 +90,23 @@ async fn main() -> Result<()> {
             );
             continue;
         }
-        let user_prompt = if prompt.eq_ignore_ascii_case("prompts") {
+        let user_message = if prompt.eq_ignore_ascii_case("prompts") {
             match collect_prompt(&mcp, &prompts).await? {
-                Some(prompt) => prompt,
+                Some(prompt) => Message::user(prompt),
                 None => continue,
             }
         } else {
             let context = select_resources(&model, &mcp, &resources, prompt).await;
-            if context.is_empty() {
-                prompt.to_owned()
-            } else {
-                format!("Question: {prompt}\n\nRelevant MCP resources:\n{context}")
-            }
+            user_message_with_resources(prompt, context)
         };
 
         let mut active_tools = vec![search.clone()];
         let mut history = Vec::new();
-        let mut next_message = Message::user(user_prompt);
+        let mut next_message = user_message;
         let mut completed = false;
-
-        for _ in 0..MAX_MODEL_CALLS {
+        let max_calls = max_model_calls()?;
+        for _ in 0..max_calls {
+            let sent_message = next_message.clone();
             let response = model
                 .call(
                     CompletionRequest::new(next_message)
@@ -124,6 +116,7 @@ async fn main() -> Result<()> {
                         .max_tokens(4096),
                 )
                 .await?;
+            history.push(sent_message);
             let answer = response.text();
             let calls = response
                 .choice
@@ -153,18 +146,22 @@ async fn main() -> Result<()> {
                         .unwrap_or_default()
                         .trim()
                         .to_lowercase();
-                    let matches = available_tools
-                        .iter()
-                        .filter(|tool| {
-                            format!(
-                                "{} {}",
-                                tool.name,
-                                tool.description.as_deref().unwrap_or("")
-                            )
-                            .to_lowercase()
-                            .contains(&query)
-                        })
-                        .collect::<Vec<_>>();
+                    let matches = if query.is_empty() {
+                        Vec::new()
+                    } else {
+                        available_tools
+                            .iter()
+                            .filter(|tool| {
+                                format!(
+                                    "{} {}",
+                                    tool.name,
+                                    tool.description.as_deref().unwrap_or("")
+                                )
+                                .to_lowercase()
+                                .contains(&query)
+                            })
+                            .collect::<Vec<_>>()
+                    };
                     let revealed = to_model_tools(&matches)?;
                     for definition in revealed {
                         if !active_tools
@@ -179,7 +176,12 @@ async fn main() -> Result<()> {
                         .map(|tool| tool.name.as_ref())
                         .collect::<Vec<_>>();
                     println!("Search {query:?} found: {}", names.join(", "));
-                    results.push(call.result(vec![ToolResultContent::text(names.join(", "))]));
+                    let search_result = if query.is_empty() {
+                        "Search query must not be empty.".to_owned()
+                    } else {
+                        names.join(", ")
+                    };
+                    results.push(call.result(vec![ToolResultContent::text(search_result)]));
                     continue;
                 }
 
@@ -203,10 +205,17 @@ async fn main() -> Result<()> {
             next_message = Message::tool_results(results);
         }
         if !completed {
-            bail!("agent reached the {MAX_MODEL_CALLS}-call model limit");
+            bail!(
+                "agent reached the {max_calls}-call model limit; increase MCP_MAX_MODEL_CALLS to allow a longer tool cycle"
+            );
         }
     }
-    mcp.cancel().await?;
+    Ok(())
+    }
+    .await;
+    let disconnect_result = mcp.cancel().await;
+    run_result?;
+    disconnect_result?;
     Ok(())
 }
 

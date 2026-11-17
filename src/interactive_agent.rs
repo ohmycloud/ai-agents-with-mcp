@@ -2,9 +2,16 @@
 
 use std::io::{self, Write};
 
-use crate::agent_loop::{run_anthropic_tool_loop, to_model_tools};
+use crate::agent_loop::{run_anthropic_tool_loop_with_message, to_model_tools};
 use anyhow::Result;
-use rig::{Model, completion::request::CompletionRequest, providers::anthropic::wire::Messages};
+use rig::{
+    Model,
+    completion::{
+        message::{DocumentMediaType, ImageMediaType, Message, MimeType, UserContent},
+        request::CompletionRequest,
+    },
+    providers::anthropic::wire::Messages,
+};
 use rmcp::{
     RoleClient,
     handler::client::ClientHandler,
@@ -56,35 +63,40 @@ pub async fn run_interactive_agent<H: ClientHandler>(
             continue;
         }
 
-        let prompt = if input.eq_ignore_ascii_case("prompts") {
+        let user_message = if input.eq_ignore_ascii_case("prompts") {
             match collect_prompt(client, &prompts).await? {
-                Some(prompt) => prompt,
+                Some(prompt) => Message::user(prompt),
                 None => continue,
             }
         } else {
             let context = select_resources(resource_selector, client, &resources, input).await;
-            if context.is_empty() {
-                input.to_owned()
-            } else {
-                format!("Question: {input}\n\nRelevant MCP resources:\n{context}")
-            }
+            user_message_with_resources(input, context)
         };
 
-        let answer = run_anthropic_tool_loop(model, client, &tools, prompt).await?;
+        let answer =
+            run_anthropic_tool_loop_with_message(model, client, &tools, user_message).await?;
         println!("Assistant: {answer}");
     }
     Ok(())
 }
 
-/// Ask the model which advertised resources are relevant and load their text.
+/// Build a user turn with its original question and selected resource blocks.
+pub fn user_message_with_resources(question: &str, resources: Vec<UserContent>) -> Message {
+    let mut content = Vec::with_capacity(resources.len() + 1);
+    content.push(UserContent::text(question));
+    content.extend(resources);
+    Message::from(content)
+}
+
+/// Ask the model which resources are relevant and load supported content.
 pub async fn select_resources<H: ClientHandler>(
     model: &Model<Messages>,
     client: &RunningService<RoleClient, H>,
     resources: &[Resource],
     question: &str,
-) -> String {
+) -> Vec<UserContent> {
     if resources.is_empty() {
-        return String::new();
+        return Vec::new();
     }
 
     let descriptions = resources
@@ -129,25 +141,66 @@ pub async fn select_resources<H: ClientHandler>(
             Ok(result) => {
                 for content in result.contents {
                     match content {
-                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                            context.push(format!("[Resource: {}]\n{text}", resource.name));
-                        }
-                        rmcp::model::ResourceContents::BlobResourceContents {
-                            mime_type, ..
-                        } => {
-                            eprintln!(
-                                "Skipping binary resource {} ({mime_type:?}).",
-                                resource.name
-                            );
-                        }
-                        _ => eprintln!("Skipping an unsupported resource content block."),
+                        resource_block => context.extend(resource_content_as_user_content(
+                            &resource.name,
+                            resource_block,
+                        )),
                     }
                 }
             }
             Err(error) => eprintln!("Could not load resource {}: {error}", resource.name),
         }
     }
-    context.join("\n\n")
+    context
+}
+
+/// Convert an MCP resource block into provider-typed user content. Text and
+/// common Anthropic image formats are retained; PDFs are also passed through.
+pub fn resource_content_as_user_content(
+    resource_name: &str,
+    content: rmcp::model::ResourceContents,
+) -> Vec<UserContent> {
+    match content {
+        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+            vec![UserContent::text(format!(
+                "[Resource: {resource_name}]\n{text}"
+            ))]
+        }
+        rmcp::model::ResourceContents::BlobResourceContents {
+            mime_type, blob, ..
+        } => {
+            let mime_type = mime_type.unwrap_or_default();
+            let normalized_mime = mime_type.to_ascii_lowercase();
+            if let Some(image_type) = ImageMediaType::from_mime_type(&normalized_mime)
+                && matches!(
+                    &image_type,
+                    ImageMediaType::JPEG
+                        | ImageMediaType::PNG
+                        | ImageMediaType::GIF
+                        | ImageMediaType::WEBP
+                )
+            {
+                return vec![
+                    UserContent::text(format!("[Resource: {resource_name} image]")),
+                    UserContent::image_base64(blob, Some(image_type), None),
+                ];
+            }
+            if normalized_mime == "application/pdf"
+                && let Some(document_type) = DocumentMediaType::from_mime_type(&normalized_mime)
+            {
+                return vec![
+                    UserContent::text(format!("[Resource: {resource_name} document]")),
+                    UserContent::document_base64(blob, Some(document_type)),
+                ];
+            }
+            eprintln!("Skipping unsupported resource {resource_name} ({mime_type:?}).");
+            Vec::new()
+        }
+        _ => {
+            eprintln!("Skipping an unsupported resource block for {resource_name}.");
+            Vec::new()
+        }
+    }
 }
 
 /// Display server prompts, collect their declared arguments, and render one.
@@ -202,17 +255,25 @@ pub async fn collect_prompt<H: ClientHandler>(
             }
             _ => argument.name.clone(),
         };
-        print!("  {label}: ");
-        io::stdout().flush()?;
-        let mut value = String::new();
-        io::stdin().read_line(&mut value)?;
-        if value.trim().is_empty() && argument.required.unwrap_or(false) {
-            print!("  {} is required; enter a value: ", argument.name);
+        let required = argument.required.unwrap_or(false);
+        loop {
+            print!("  {label}: ");
             io::stdout().flush()?;
-            io::stdin().read_line(&mut value)?;
-        }
-        if !value.trim().is_empty() {
-            arguments.insert(argument.name.clone(), value.trim().to_owned().into());
+            let mut value = String::new();
+            if io::stdin().read_line(&mut value)? == 0 {
+                println!("Input closed; prompt was cancelled.");
+                return Ok(None);
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                if required {
+                    println!("  {} is required.", argument.name);
+                    continue;
+                }
+                break;
+            }
+            arguments.insert(argument.name.clone(), value.to_owned().into());
+            break;
         }
     }
 

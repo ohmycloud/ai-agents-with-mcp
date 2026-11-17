@@ -1,5 +1,6 @@
 //! Server-side examples for MCP context, notifications, pagination, roots, and cancellation.
 
+use crate::path_utils::canonical_path_from_file_uri;
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -594,10 +595,8 @@ impl RootsServer {
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let allowed = roots.roots.iter().any(|root| {
-            root.uri
-                .strip_prefix("file://")
-                .map(PathBuf::from)
-                .and_then(|path| path.canonicalize().ok())
+            canonical_path_from_file_uri(&root.uri)
+                .ok()
                 .is_some_and(|root_path| requested.starts_with(root_path))
         });
         if !allowed {

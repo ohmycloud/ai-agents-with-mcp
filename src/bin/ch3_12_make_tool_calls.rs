@@ -49,26 +49,32 @@ async fn run_agent() -> Result<()> {
             .join(", ")
     );
 
-    loop {
-        print!("You: ");
-        io::stdout().flush()?;
+    let agent_result: Result<()> = async {
+        loop {
+            print!("You: ");
+            io::stdout().flush()?;
 
-        let mut prompt = String::new();
-        if io::stdin().read_line(&mut prompt)? == 0 {
-            break;
-        }
-        let prompt = prompt.trim();
-        if prompt.eq_ignore_ascii_case("goodbye") {
-            println!("AI Assistant: Goodbye!");
-            break;
-        }
-        if prompt.is_empty() {
-            continue;
+            let mut prompt = String::new();
+            if io::stdin().read_line(&mut prompt)? == 0 {
+                break;
+            }
+            let prompt = prompt.trim();
+            if prompt.eq_ignore_ascii_case("goodbye") {
+                println!("AI Assistant: Goodbye!");
+                break;
+            }
+            if prompt.is_empty() {
+                continue;
+            }
+
+            let answer = run_anthropic_tool_loop(&model, &mcp_client, &model_tools, prompt).await?;
+            println!("AI Assistant: {answer}");
         }
 
-        let answer = run_anthropic_tool_loop(&model, &mcp_client, &model_tools, prompt).await?;
-        println!("AI Assistant: {answer}");
+        Ok(())
     }
+    .await;
 
-    Ok(())
+    mcp_client.cancel().await?;
+    agent_result
 }

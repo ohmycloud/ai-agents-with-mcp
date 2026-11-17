@@ -10,5 +10,6 @@ pub mod config;
 pub mod content_server;
 pub mod deployment_calculator;
 pub mod interactive_agent;
+pub mod path_utils;
 pub mod tool_results;
 pub mod tutorial_servers;

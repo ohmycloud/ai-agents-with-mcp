@@ -4,6 +4,7 @@
 )]
 //! Calculator MCP server shared by the stdio client examples.
 
+use crate::path_utils::canonical_path_from_file_uri;
 use std::{path::PathBuf, sync::Arc};
 
 use rmcp::{
@@ -304,10 +305,8 @@ impl Calculator {
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let allowed = roots.roots.iter().any(|root| {
-            root.uri
-                .strip_prefix("file://")
-                .map(PathBuf::from)
-                .and_then(|path| path.canonicalize().ok())
+            canonical_path_from_file_uri(&root.uri)
+                .ok()
                 .is_some_and(|root_path| requested.starts_with(root_path))
         });
         if !allowed {

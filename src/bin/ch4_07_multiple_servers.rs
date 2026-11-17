@@ -1,20 +1,24 @@
-//! Chapter 4.7: combine multiple MCP tool, resource, and prompt servers.
+//! Chapter 4.7: select calculator resources and prompts for each turn.
+//!
+//! The Python lesson is named "multiple servers", but its agent connects only
+//! to the calculator server. This binary mirrors that actual execution path.
 
 use std::{
     env,
     io::{self, Write},
-    path::PathBuf,
     process::Stdio,
 };
 
 use ai_agents_with_mcp::{
     calculator_server::serve_stdio as serve_calculator,
     client_callbacks::CalculatorClientHandler,
-    config::{anthropic_client, anthropic_model, load_dotenv},
-    content_server::serve_stdio as serve_content,
+    config::{
+        anthropic_client, anthropic_model, load_dotenv, max_model_calls, mcp_root, mcp_root_uri,
+    },
+    interactive_agent::resource_content_as_user_content,
     tool_results::content_as_strings,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail};
 use rig::Model;
 use rig::completion::{
     message::{AssistantContent, Message, ToolName, ToolResultContent},
@@ -31,95 +35,54 @@ use rmcp::{
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
 
-const MAX_MODEL_CALLS: usize = 16;
 type McpClient = RunningService<RoleClient, CalculatorClientHandler>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ServerKind {
-    Calculator,
-    Content,
-}
-
-impl ServerKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Calculator => "calculator",
-            Self::Content => "content",
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RoutedTool {
-    model_name: String,
-    server: ServerKind,
-    server_name: String,
-}
-
-#[derive(Clone)]
-struct RoutedResource {
-    id: String,
-    server: ServerKind,
-    resource: Resource,
-}
-
-#[derive(Clone)]
-struct RoutedPrompt {
-    id: String,
-    server: ServerKind,
-    prompt: Prompt,
+#[derive(Debug)]
+struct SelectedPrompt {
+    name: String,
+    arguments: Map<String, Value>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match env::args().nth(1).as_deref() {
-        Some("--calculator-server") => return serve_calculator().await,
-        Some("--content-server") => return serve_content().await,
-        _ => {}
+    if env::args().nth(1).as_deref() == Some("--calculator-server") {
+        return serve_calculator().await;
     }
 
     load_dotenv();
-    let model_client = anthropic_client()?;
     let default_model = anthropic_model()?;
+    let model_client = anthropic_client()?;
     let model = model_client.completion(default_model.clone());
-    let root = env::var_os("MCP_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?);
-    let root = root
-        .canonicalize()
-        .context("MCP_ROOT must point to an existing directory")?;
-    ensure!(root.is_dir(), "MCP_ROOT must point to a directory");
-    let handler = CalculatorClientHandler::new(format!("file://{}", root.display()), default_model);
-    let executable = env::current_exe()?;
-
-    let mut calculator_command = Command::new(&executable);
-    calculator_command
+    let root = mcp_root()?;
+    let handler = CalculatorClientHandler::new(mcp_root_uri(&root)?, default_model);
+    let mut server_command = Command::new(env::current_exe()?);
+    server_command
         .arg("--calculator-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
-    let calculator = handler
-        .clone()
-        .serve(TokioChildProcess::new(calculator_command)?)
+    let client = handler
+        .serve(TokioChildProcess::new(server_command)?)
         .await?;
 
-    let mut content_command = Command::new(executable);
-    content_command
-        .arg("--content-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    let content = handler
-        .serve(TokioChildProcess::new(content_command)?)
-        .await?;
+    let run_result = run_agent(&model, &client).await;
+    let disconnect_result = client.cancel().await;
+    run_result?;
+    disconnect_result?;
+    Ok(())
+}
 
-    let (mut tools, mut routed_tools) = collect_tools(&calculator, &content).await?;
-    let mut resources = collect_resources(&calculator, &content).await?;
-    let mut prompts = collect_prompts(&calculator, &content).await?;
+async fn run_agent(
+    model: &Model<rig::providers::anthropic::wire::Messages>,
+    client: &McpClient,
+) -> Result<()> {
     println!(
-        "Connected servers: calculator (tools/resources/prompts), content (resources/prompts)"
+        "Welcome to your AI Assistant. Type 'goodbye' to quit or 'refresh' to reload and redisplay available resources."
     );
+    let tools = collect_tools(client).await?;
+    let mut resources = client.list_all_resources().await?;
+    let mut prompts = client.list_all_prompts().await?;
     println!(
-        "Loaded {} tools, {} resources, and {} prompts.",
-        tools.len(),
+        "Loaded {} resources and {} prompts.",
         resources.len(),
         prompts.len()
     );
@@ -140,182 +103,120 @@ async fn main() -> Result<()> {
             continue;
         }
         if question.eq_ignore_ascii_case("refresh") {
-            (tools, routed_tools) = collect_tools(&calculator, &content).await?;
-            resources = collect_resources(&calculator, &content).await?;
-            prompts = collect_prompts(&calculator, &content).await?;
+            resources = client.list_all_resources().await?;
+            prompts = client.list_all_prompts().await?;
             println!(
-                "Refreshed {} tools, {} resources, and {} prompts.",
-                tools.len(),
+                "Refreshed {} resources and {} prompts.",
                 resources.len(),
                 prompts.len()
             );
             continue;
         }
 
-        let selected_resources = select_resources(&model, &resources, question).await;
-        let selected_prompts = select_prompts(&model, &prompts, question).await;
-        let resource_context =
-            load_resources(&calculator, &content, &resources, &selected_resources).await;
-        let system_instructions =
-            load_prompts(&calculator, &content, &prompts, selected_prompts).await;
-        let user_prompt = if resource_context.is_empty() {
-            question.to_owned()
-        } else {
-            format!("Question: {question}\n\nRelevant MCP resources:\n{resource_context}")
-        };
+        let selected_resources = select_resources(model, &resources, question).await;
+        let selected_prompts = select_prompts(model, &prompts, question).await;
+        let resource_context = load_resources(client, &resources, &selected_resources).await;
+        let system_instructions = load_prompts(client, &prompts, selected_prompts).await;
+        let mut user_content = vec![rig::completion::message::UserContent::text(question)];
+        user_content.extend(resource_context);
+        let user_message = Message::from(user_content);
 
-        let mut history = Vec::new();
-        let mut next_message = Message::user(user_prompt);
-        let mut completed = false;
-        for _ in 0..MAX_MODEL_CALLS {
-            let mut request = CompletionRequest::new(next_message)
-                .messages(history.iter().cloned())
-                .tools(tools.iter().cloned())
-                .max_tokens(4096);
-            if !system_instructions.is_empty() {
-                request = request.preamble(system_instructions.clone());
-            }
-            let response = model.call(request).await?;
-            let answer = response.text();
-            let calls = response
-                .choice
-                .iter()
-                .filter_map(|item| match item {
-                    AssistantContent::ToolCall(call) => Some(call.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if let Some(message) = response.message() {
-                history.push(message);
-            }
-            if calls.is_empty() {
-                println!(
-                    "AI Assistant: {}",
-                    if answer.trim().is_empty() {
-                        "[No text response available]"
-                    } else {
-                        &answer
-                    }
-                );
-                completed = true;
-                break;
-            }
-
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                let qualified_name = call.function.name.as_str();
-                let Some(route) = routed_tools
-                    .iter()
-                    .find(|route| route.model_name == qualified_name)
-                else {
-                    let mut result = call.result(vec![ToolResultContent::text(format!(
-                        "No MCP tool is registered as {qualified_name:?}."
-                    ))]);
-                    result.is_error = true;
-                    results.push(result);
-                    continue;
-                };
-                println!("Using {} tool: {}", route.server.label(), route.server_name);
-                let request = CallToolRequestParams::new(route.server_name.clone())
-                    .with_arguments(call.function.arguments.clone());
-                let response = match route.server {
-                    ServerKind::Calculator => calculator.call_tool(request).await,
-                    ServerKind::Content => content.call_tool(request).await,
-                };
-                let (text, is_error) = match response {
-                    Ok(result) => (
-                        content_as_strings(&result.content).join("\n"),
-                        result.is_error.unwrap_or(false),
-                    ),
-                    Err(error) => (format!("MCP tool call failed: {error}"), true),
-                };
-                let mut result = call.result(vec![ToolResultContent::text(text)]);
-                result.is_error = is_error;
-                results.push(result);
-            }
-            next_message = Message::tool_results(results);
-        }
-        if !completed {
-            bail!("agent reached the {MAX_MODEL_CALLS}-call model limit");
-        }
+        run_tool_loop(model, client, &tools, user_message, system_instructions).await?;
     }
 
-    calculator.cancel().await?;
-    content.cancel().await?;
     Ok(())
 }
 
-async fn collect_tools(
-    calculator: &McpClient,
-    content: &McpClient,
-) -> Result<(Vec<ToolDefinition>, Vec<RoutedTool>)> {
-    let mut definitions = Vec::new();
-    let mut routes = Vec::new();
-    for (server, tools) in [
-        (ServerKind::Calculator, calculator.list_all_tools().await?),
-        (ServerKind::Content, content.list_all_tools().await?),
-    ] {
-        for tool in tools {
-            let model_name = format!("{}__{}", server.label(), tool.name);
-            let definition = ToolDefinition::new(
-                ToolName::new(model_name.clone())?,
+async fn collect_tools(client: &McpClient) -> Result<Vec<ToolDefinition>> {
+    client
+        .list_all_tools()
+        .await?
+        .into_iter()
+        .map(|tool| {
+            Ok(ToolDefinition::new(
+                ToolName::new(tool.name.to_string())?,
                 tool.description.as_deref().unwrap_or_default(),
                 serde_json::to_value(tool.input_schema.as_ref())?,
+            ))
+        })
+        .collect()
+}
+
+async fn run_tool_loop(
+    model: &Model<rig::providers::anthropic::wire::Messages>,
+    client: &McpClient,
+    tools: &[ToolDefinition],
+    initial_message: Message,
+    system_instructions: String,
+) -> Result<()> {
+    let mut history = Vec::new();
+    let mut next_message = initial_message;
+    let max_calls = max_model_calls()?;
+
+    for _ in 0..max_calls {
+        let sent_message = next_message.clone();
+        let mut request = CompletionRequest::new(next_message)
+            .messages(history.iter().cloned())
+            .tools(tools.iter().cloned())
+            .max_tokens(4096);
+        if !system_instructions.is_empty() {
+            request = request.preamble(system_instructions.clone());
+        }
+        let response = model.call(request).await?;
+        history.push(sent_message);
+        let answer = response.text();
+        let calls = response
+            .choice
+            .iter()
+            .filter_map(|item| match item {
+                AssistantContent::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(message) = response.message() {
+            history.push(message);
+        }
+        if calls.is_empty() {
+            let text_blocks = answer.trim();
+            println!(
+                "Assistant: {}",
+                if text_blocks.is_empty() {
+                    "[No text response available]"
+                } else {
+                    text_blocks
+                }
             );
-            routes.push(RoutedTool {
-                model_name,
-                server,
-                server_name: tool.name.to_string(),
-            });
-            definitions.push(definition);
+            return Ok(());
         }
-    }
-    Ok((definitions, routes))
-}
 
-async fn collect_resources(
-    calculator: &McpClient,
-    content: &McpClient,
-) -> Result<Vec<RoutedResource>> {
-    let mut resources = Vec::new();
-    for (server, items) in [
-        (
-            ServerKind::Calculator,
-            calculator.list_all_resources().await?,
-        ),
-        (ServerKind::Content, content.list_all_resources().await?),
-    ] {
-        for resource in items {
-            resources.push(RoutedResource {
-                id: format!("{}::{}", server.label(), resource.name),
-                server,
-                resource,
-            });
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let name = call.function.name.as_str();
+            println!("Using tool: {name}");
+            let params = CallToolRequestParams::new(name.to_owned())
+                .with_arguments(call.function.arguments.clone());
+            let (content, is_error) = match client.call_tool(params).await {
+                Ok(result) => (
+                    content_as_strings(&result.content).join("\n"),
+                    result.is_error.unwrap_or(false),
+                ),
+                Err(error) => (format!("MCP tool call failed: {error}"), true),
+            };
+            let mut result = call.result(vec![ToolResultContent::text(content)]);
+            result.is_error = is_error;
+            results.push(result);
         }
+        next_message = Message::tool_results(results);
     }
-    Ok(resources)
-}
 
-async fn collect_prompts(calculator: &McpClient, content: &McpClient) -> Result<Vec<RoutedPrompt>> {
-    let mut prompts = Vec::new();
-    for (server, items) in [
-        (ServerKind::Calculator, calculator.list_all_prompts().await?),
-        (ServerKind::Content, content.list_all_prompts().await?),
-    ] {
-        for prompt in items {
-            prompts.push(RoutedPrompt {
-                id: format!("{}::{}", server.label(), prompt.name),
-                server,
-                prompt,
-            });
-        }
-    }
-    Ok(prompts)
+    bail!(
+        "agent reached the {max_calls}-call model limit; increase MCP_MAX_MODEL_CALLS to allow a longer tool cycle"
+    )
 }
 
 async fn select_resources(
     model: &Model<rig::providers::anthropic::wire::Messages>,
-    resources: &[RoutedResource],
+    resources: &[Resource],
     question: &str,
 ) -> Vec<String> {
     if resources.is_empty() {
@@ -323,18 +224,20 @@ async fn select_resources(
     }
     let descriptions = resources
         .iter()
-        .map(|item| {
+        .map(|resource| {
             (
-                item.id.clone(),
-                json!({
-                    "name": &item.resource.name,
-                    "description": item.resource.description.as_deref().unwrap_or("(no description)"),
-                }),
+                resource.name.clone(),
+                Value::String(
+                    resource
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("Resource: {}", resource.name)),
+                ),
             )
         })
         .collect::<Map<_, _>>();
     let prompt = format!(
-        "Given this user question: {question:?}\n\nAvailable MCP resources:\n{}\n\nReturn only a JSON array of resource ids that are directly relevant, or an empty array if none are relevant.",
+        "Given this user question: {question:?}\n\nAnd these available resources:\n{}\n\nWhich resources (if any) would be helpful to answer the user's question? Return a JSON array of resource names, or an empty array. Only include directly relevant resources.",
         serde_json::to_string_pretty(&descriptions).unwrap_or_default()
     );
     match model
@@ -343,7 +246,11 @@ async fn select_resources(
     {
         Ok(response) => parse_string_array(&response.text())
             .into_iter()
-            .filter(|id| resources.iter().any(|resource| &resource.id == id))
+            .filter(|name| {
+                resources
+                    .iter()
+                    .any(|resource| resource.name.as_str() == name.as_str())
+            })
             .collect(),
         Err(error) => {
             eprintln!("Failed to select resources with model: {error}");
@@ -354,29 +261,28 @@ async fn select_resources(
 
 async fn select_prompts(
     model: &Model<rig::providers::anthropic::wire::Messages>,
-    prompts: &[RoutedPrompt],
+    prompts: &[Prompt],
     question: &str,
-) -> Vec<(String, Map<String, Value>)> {
+) -> Vec<SelectedPrompt> {
     if prompts.is_empty() {
         return Vec::new();
     }
     let templates = prompts
         .iter()
-        .map(|item| {
+        .map(|prompt| {
             json!({
-                "id": &item.id,
-                "name": &item.prompt.name,
-                "description": item.prompt.description.as_deref().unwrap_or("(no description)"),
-                "arguments": item.prompt.arguments.as_deref().unwrap_or_default(),
+                "name": prompt.name,
+                "description": prompt.description,
+                "arguments": prompt.arguments,
             })
         })
         .collect::<Vec<_>>();
-    let selection_prompt = format!(
-        "Given this user question: {question:?}\n\nAvailable MCP prompt templates:\n{}\n\nReturn only a JSON array of prompt objects with an id and arguments object. Return an empty array if none are directly relevant.",
+    let prompt = format!(
+        "Given this user question: {question:?}\n\nAnd these available prompt templates:\n{}\n\nWhich prompts (if any) would provide helpful instructions or guidance? Return a JSON array of prompt objects with a name and arguments object, or an empty array. Only include directly relevant prompts.",
         serde_json::to_string_pretty(&templates).unwrap_or_default()
     );
     let response = match model
-        .call(CompletionRequest::new(selection_prompt).max_tokens(300))
+        .call(CompletionRequest::new(prompt).max_tokens(200))
         .await
     {
         Ok(response) => response,
@@ -385,8 +291,8 @@ async fn select_prompts(
             return Vec::new();
         }
     };
-    let answer = response.text();
-    let Some(json) = json_array_slice(&answer) else {
+    let response_text = response.text();
+    let Some(json) = json_array_slice(&response_text) else {
         return Vec::new();
     };
     let Ok(Value::Array(selected)) = serde_json::from_str::<Value>(json) else {
@@ -396,8 +302,8 @@ async fn select_prompts(
         .into_iter()
         .filter_map(|entry| {
             let object = entry.as_object()?;
-            let id = object.get("id")?.as_str()?.to_owned();
-            if !prompts.iter().any(|prompt| prompt.id == id) {
+            let name = object.get("name")?.as_str()?.to_owned();
+            if !prompts.iter().any(|prompt| prompt.name == name) {
                 return None;
             }
             let arguments = object
@@ -405,73 +311,60 @@ async fn select_prompts(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            Some((id, arguments))
+            Some(SelectedPrompt { name, arguments })
         })
         .collect()
 }
 
 async fn load_resources(
-    calculator: &McpClient,
-    content: &McpClient,
-    resources: &[RoutedResource],
+    client: &McpClient,
+    resources: &[Resource],
     selected: &[String],
-) -> String {
+) -> Vec<rig::completion::message::UserContent> {
     let mut context = Vec::new();
-    for item in resources
+    for resource in resources
         .iter()
-        .filter(|item| selected.iter().any(|id| id == &item.id))
+        .filter(|resource| selected.iter().any(|name| name == &resource.name))
     {
-        println!("LLM selected resource: {}", item.id);
-        let request = ReadResourceRequestParams::new(item.resource.uri.clone());
-        let response = match item.server {
-            ServerKind::Calculator => calculator.read_resource(request).await,
-            ServerKind::Content => content.read_resource(request).await,
-        };
-        match response {
+        println!("LLM selected resource: {}", resource.name);
+        match client
+            .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
+            .await
+        {
             Ok(response) => {
                 for contents in response.contents {
-                    match contents {
-                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                            context.push(format!("[Resource: {}]\n{text}", item.id));
-                        }
-                        rmcp::model::ResourceContents::BlobResourceContents {
-                            mime_type, ..
-                        } => {
-                            eprintln!("Skipping binary resource {} ({mime_type:?}).", item.id);
-                        }
-                        _ => eprintln!("Skipping an unsupported resource block for {}.", item.id),
-                    }
+                    context.extend(resource_content_as_user_content(&resource.name, contents));
                 }
             }
-            Err(error) => eprintln!("Could not load resource {}: {error}", item.id),
+            Err(error) => eprintln!("Error loading resource {}: {error}", resource.name),
         }
     }
-    context.join("\n\n")
+    context
 }
 
 async fn load_prompts(
-    calculator: &McpClient,
-    content: &McpClient,
-    prompts: &[RoutedPrompt],
-    selected: Vec<(String, Map<String, Value>)>,
+    client: &McpClient,
+    prompts: &[Prompt],
+    selected: Vec<SelectedPrompt>,
 ) -> String {
     let mut instructions = Vec::new();
-    for (id, arguments) in selected {
-        let Some(item) = prompts.iter().find(|prompt| prompt.id == id) else {
+    for selected_prompt in selected {
+        let Some(prompt) = prompts
+            .iter()
+            .find(|prompt| prompt.name == selected_prompt.name)
+        else {
             continue;
         };
-        println!("Using prompt: {}", item.id);
-        let request = GetPromptRequestParams::new(item.prompt.name.clone()).with_arguments(
-            arguments
-                .into_iter()
-                .map(|(key, value)| (key, Value::String(value_to_text(value))))
-                .collect::<Map<_, _>>(),
-        );
-        let response = match item.server {
-            ServerKind::Calculator => calculator.get_prompt(request).await,
-            ServerKind::Content => content.get_prompt(request).await,
-        };
-        match response {
+        println!("Using prompt: {}", prompt.name);
+        let arguments = selected_prompt
+            .arguments
+            .into_iter()
+            .map(|(key, value)| (key, Value::String(value_to_text(&value))))
+            .collect();
+        match client
+            .get_prompt(GetPromptRequestParams::new(prompt.name.clone()).with_arguments(arguments))
+            .await
+        {
             Ok(response) => {
                 let text = response
                     .messages
@@ -480,20 +373,19 @@ async fn load_prompts(
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !text.trim().is_empty() {
-                    instructions.push(format!("[Prompt: {}]\n{}", item.id, text.trim()));
+                    instructions.push(format!("[Prompt: {}]\n{}", prompt.name, text.trim()));
                 }
             }
-            Err(error) => eprintln!("Could not load prompt {}: {error}", item.id),
+            Err(error) => eprintln!("Error loading prompt {}: {error}", prompt.name),
         }
     }
     instructions.join("\n\n")
 }
 
-fn value_to_text(value: Value) -> String {
+fn value_to_text(value: &Value) -> String {
     value
         .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string())
+        .map_or_else(|| value.to_string(), str::to_owned)
 }
 
 fn parse_string_array(answer: &str) -> Vec<String> {

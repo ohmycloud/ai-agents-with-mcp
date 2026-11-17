@@ -21,6 +21,8 @@ ANTHROPIC_BASE_URL=https://api.example.com
 
 The base URL and API key are read centrally by `src/config.rs`; chapter files do
 not construct provider clients with their own credentials.
+Tool loops stop after 32 model calls by default. Set `MCP_MAX_MODEL_CALLS` to a
+different positive integer when a lesson needs a longer cycle.
 
 ## Examples
 
@@ -49,7 +51,8 @@ The stdio client examples start their demo server as a child process.
 The resource and prompt examples serve the course calculator's
 `resource://math-constants` resource and `calculate_operation` prompt. In
 `ch3_15` and `ch3_18`, the selected resource or rendered prompt is passed into
-the shared explicit MCP calculator tool loop.
+the shared explicit MCP calculator tool loop. The shared agent also carries
+supported image and PDF resource blocks to Anthropic as typed multimodal input.
 
 For Streamable HTTP, start this server in one terminal:
 
@@ -92,22 +95,27 @@ fall back to `ANTHROPIC_MODEL`. Asking the agent to install the plugin adds a
 `bonus_tool` during the session; the client refreshes the advertised tool list
 after that turn. `MCP_ROOT` defaults to the current directory.
 
-`ch4_07_multiple_servers` connects to separate calculator and content servers.
-The model chooses relevant resources and prompts from both servers on each
-turn, and tool names are namespaced by server. Type `refresh` to reload tools,
-resources, and prompts from both connections.
+`ch4_07_multiple_servers` follows the Python agent's actual connection path:
+it connects to the calculator server and chooses relevant calculator
+resources and prompts on each turn. Type `refresh` to reload its resources and
+prompts; the tool list loads once at startup, as in Python. The Python chapter
+is named "multiple servers", but its agent currently starts only the
+calculator server.
 
 The sampling host needs `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`. The roots and
 elicitation examples start local stdio servers and invoke their tools so the
 server exercises each client callback. Set `MCP_ROOT` to choose the directory
-advertised by the roots examples. The elicitation demo accepts when both
-`MCP_SIGNUP_NAME` and `MCP_SIGNUP_EMAIL` are set; without them it demonstrates
-the decline path. The subscription example starts a local dynamic-tools server
-by default; ask it to install the plugin to receive a tool-list change and use
-the new `bonus_tool` on the following turn. Set `MCP_SERVER_URL` to connect to
-an already-running calculator HTTP server instead. The ch4.8 and ch4.9 agents
-also support resource selection, prompt loading, and the `refresh`/`prompts`
-commands.
+advertised by the roots examples. The ch4_03 elicitation flow always asks for
+interactive consent and form data. In ch4.05, ch4.07, and ch4.08–ch4.10, set
+both `MCP_SIGNUP_NAME` and `MCP_SIGNUP_EMAIL` to auto-accept signup requests;
+without both values, the handler prompts interactively. For the subscription
+example, first run `cargo run --bin ch4_http_demo_server` in a separate
+terminal, then run `ch4_10_recovering_subscriptions`. The server defaults to
+`127.0.0.1:8000`; set `MCP_BIND_ADDRESS` to change its bind address or
+`MCP_SERVER_URL` on the agent to connect elsewhere. Ask the agent to install
+the plugin to receive a tool-list change and use `bonus_tool` on the next turn.
+The ch4.8 and ch4.9 agents also support resource selection, prompt loading, and
+the `refresh`/`prompts` commands.
 
 `ch4_04_authorizing_oauth` performs OAuth authorization code + PKCE against the
 server at `MCP_SERVER_URL` (default `http://127.0.0.1:8000/mcp`). It prints the

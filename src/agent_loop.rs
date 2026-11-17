@@ -13,11 +13,14 @@ use rmcp::{
     RoleClient, handler::client::ClientHandler, model::Tool as McpTool, service::RunningService,
 };
 
-use crate::tool_results::content_as_strings;
-
-const MAX_MODEL_CALLS: usize = 16;
+use crate::{config::max_model_calls, tool_results::content_as_strings};
 
 /// Convert MCP tool schemas into provider-neutral Rig definitions.
+///
+/// # Errors
+///
+/// Returns an error if an MCP tool name is invalid for Rig or its schema cannot
+/// be serialized.
 pub fn to_model_tools(tools: &[McpTool]) -> Result<Vec<ToolDefinition>> {
     tools
         .iter()
@@ -32,16 +35,37 @@ pub fn to_model_tools(tools: &[McpTool]) -> Result<Vec<ToolDefinition>> {
 }
 
 /// Run a handwritten tool loop against one initialized MCP client.
+///
+/// # Errors
+///
+/// Returns an error if model configuration or a model request fails, or if the
+/// configured model-call limit is reached before a final response.
 pub async fn run_anthropic_tool_loop<H: ClientHandler>(
     model: &Model<Messages>,
     client: &RunningService<RoleClient, H>,
     tools: &[ToolDefinition],
     prompt: impl Into<String>,
 ) -> Result<String> {
-    let mut history = Vec::new();
-    let mut next_message = Message::user(prompt.into());
+    run_anthropic_tool_loop_with_message(model, client, tools, Message::user(prompt.into())).await
+}
 
-    for _ in 0..MAX_MODEL_CALLS {
+/// Run the tool loop with a prebuilt message, including typed image context.
+///
+/// # Errors
+///
+/// Returns an error if model configuration or a model request fails, or if the
+/// configured model-call limit is reached before a final response.
+pub async fn run_anthropic_tool_loop_with_message<H: ClientHandler>(
+    model: &Model<Messages>,
+    client: &RunningService<RoleClient, H>,
+    tools: &[ToolDefinition],
+    initial_message: Message,
+) -> Result<String> {
+    let mut history = Vec::new();
+    let mut next_message = initial_message;
+    let max_calls = max_model_calls()?;
+
+    for _ in 0..max_calls {
         let sent_message = next_message.clone();
         let response = model
             .call(
@@ -92,5 +116,7 @@ pub async fn run_anthropic_tool_loop<H: ClientHandler>(
         next_message = Message::tool_results(results);
     }
 
-    bail!("agent reached the {MAX_MODEL_CALLS}-call limit")
+    bail!(
+        "agent reached the {max_calls}-call model limit; increase MCP_MAX_MODEL_CALLS to allow a longer tool cycle"
+    )
 }

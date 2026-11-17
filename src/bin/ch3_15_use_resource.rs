@@ -7,14 +7,14 @@ use std::{
 };
 
 use ai_agents_with_mcp::{
-    agent_loop::{run_anthropic_tool_loop, to_model_tools},
+    agent_loop::{run_anthropic_tool_loop_with_message, to_model_tools},
     calculator_server::serve_stdio as serve_calculator,
     ch3_content_server::serve_stdio as serve_content,
     config::{anthropic_client, anthropic_model, load_dotenv},
+    interactive_agent::{select_resources, user_message_with_resources},
 };
 use anyhow::Result;
-use rig::completion::request::CompletionRequest;
-use rmcp::{ServiceExt, model::ReadResourceRequestParams, transport::TokioChildProcess};
+use rmcp::{ServiceExt, transport::TokioChildProcess};
 use tokio::process::Command;
 
 #[tokio::main]
@@ -44,96 +44,48 @@ async fn main() -> Result<()> {
         .stdout(Stdio::piped());
     let calculator = ().serve(TokioChildProcess::new(calculator_command)?).await?;
 
-    let resources = content.list_all_resources().await?;
-    let mcp_tools = calculator.list_all_tools().await?;
-    let model_tools = to_model_tools(&mcp_tools)?;
-    println!("Connected tools: {}", tool_names(&mcp_tools));
-
-    println!("Ask a question (type 'goodbye' to quit).");
-    loop {
-        print!("You: ");
-        io::stdout().flush()?;
-        let mut question = String::new();
-        if io::stdin().read_line(&mut question)? == 0 {
-            break;
-        }
-        let question = question.trim();
-        if question.eq_ignore_ascii_case("goodbye") {
-            println!("AI Assistant: Goodbye!");
-            break;
-        }
-        if question.is_empty() {
-            continue;
-        }
-
-        let descriptions = resources
-            .iter()
-            .map(|resource| {
-                (
-                    resource.name.clone(),
-                    serde_json::Value::String(
-                        resource
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| format!("Resource: {}", resource.name)),
-                    ),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
-        let selection_prompt = format!(
-            "Given this user question: {question:?}\n\nAvailable MCP resources:\n{}\n\nReturn only a JSON array of resource names that are directly relevant, or an empty array if none are relevant.",
-            serde_json::to_string_pretty(&descriptions)?
-        );
-        let selected = match model
-            .call(CompletionRequest::new(selection_prompt).max_tokens(200))
-            .await
-        {
-            Ok(response) => {
-                let answer = response.text();
-                match (answer.find('['), answer.rfind(']')) {
-                    (Some(start), Some(end)) if end >= start => {
-                        serde_json::from_str::<Vec<String>>(&answer[start..=end])
-                            .unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                }
+    let run_result: Result<()> = async {
+        let resources = content.list_all_resources().await?;
+        let mcp_tools = calculator.list_all_tools().await?;
+        let model_tools = to_model_tools(&mcp_tools)?;
+        println!("Connected tools: {}", tool_names(&mcp_tools));
+        println!("Ask a question (type 'goodbye' to quit).");
+        loop {
+            print!("You: ");
+            io::stdout().flush()?;
+            let mut question = String::new();
+            if io::stdin().read_line(&mut question)? == 0 {
+                break;
             }
-            Err(error) => {
-                eprintln!("Failed to select resources with model: {error}");
-                Vec::new()
+            let question = question.trim();
+            if question.eq_ignore_ascii_case("goodbye") {
+                println!("AI Assistant: Goodbye!");
+                break;
             }
-        };
+            if question.is_empty() {
+                continue;
+            }
 
-        let mut resource_context = Vec::new();
-        for resource in resources
-            .iter()
-            .filter(|resource| selected.iter().any(|name| name == &resource.name))
-        {
-            println!("LLM selected resource: {}", resource.name);
-            let result = content
-                .read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
-                .await?;
-            for item in result.contents {
-                if let rmcp::model::ResourceContents::TextResourceContents { text, .. } = item {
-                    resource_context.push(format!("[Resource: {}]\n{text}", resource.name));
-                }
-            }
-        }
-        let user_content = if resource_context.is_empty() {
-            question.to_owned()
-        } else {
-            format!(
-                "Question: {question}\n\nRelevant MCP resources:\n{}",
-                resource_context.join("\n\n")
+            let context = select_resources(&model, &content, &resources, question).await;
+            let user_message = user_message_with_resources(question, context);
+            let answer = run_anthropic_tool_loop_with_message(
+                &model,
+                &calculator,
+                &model_tools,
+                user_message,
             )
-        };
-        let answer =
-            run_anthropic_tool_loop(&model, &calculator, &model_tools, user_content).await?;
-        println!("AI Assistant: {answer}");
+            .await?;
+            println!("AI Assistant: {answer}");
+        }
+        Ok(())
     }
+    .await;
 
-    content.cancel().await?;
-    calculator.cancel().await?;
+    let content_cancel_result = content.cancel().await;
+    let calculator_cancel_result = calculator.cancel().await;
+    run_result?;
+    content_cancel_result?;
+    calculator_cancel_result?;
     Ok(())
 }
 

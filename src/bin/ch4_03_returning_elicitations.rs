@@ -1,14 +1,14 @@
 //! Chapter 4.3: an interactive agent that handles server elicitation requests.
 
-use std::{env, path::PathBuf, process::Stdio};
+use std::{env, process::Stdio};
 
 use ai_agents_with_mcp::{
     calculator_server::serve_stdio,
     client_callbacks::{CalculatorClientHandler, CallbackFeatures},
-    config::{anthropic_client, anthropic_model, load_dotenv},
+    config::{anthropic_client, anthropic_model, load_dotenv, mcp_root, mcp_root_uri},
     interactive_agent::run_interactive_agent,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use rmcp::{ServiceExt, transport::TokioChildProcess};
 use tokio::process::Command;
 
@@ -22,15 +22,9 @@ async fn main() -> Result<()> {
     let provider = anthropic_client()?;
     let model_name = anthropic_model()?;
     let model = provider.completion(model_name.clone());
-    let root = env::var_os("MCP_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?);
-    let root = root
-        .canonicalize()
-        .context("MCP_ROOT must point to an existing directory")?;
-    ensure!(root.is_dir(), "MCP_ROOT must point to a directory");
+    let root = mcp_root()?;
     let handler = CalculatorClientHandler::for_chapter(
-        format!("file://{}", root.display()),
+        mcp_root_uri(&root)?,
         model_name,
         CallbackFeatures::ALL,
         false,
@@ -48,7 +42,9 @@ async fn main() -> Result<()> {
         .await
         .context("could not start the local calculator MCP server")?;
 
-    run_interactive_agent(&model, &model, &client).await?;
-    client.cancel().await?;
+    let run_result = run_interactive_agent(&model, &model, &client).await;
+    let disconnect_result = client.cancel().await;
+    run_result?;
+    disconnect_result?;
     Ok(())
 }
